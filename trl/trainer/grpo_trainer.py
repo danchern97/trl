@@ -1091,6 +1091,142 @@ class GRPOTrainer(Trainer):
         # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
+    
+    @profiling_decorator
+    def step(self, data: list[dict[str, Union[torch.Tensor, list[torch.Tensor]]]]):
+        """
+        Performs a single training step using pre-generated data.
+
+        Args:
+            data (`list[dict]`):
+                A list of dictionaries, where each dictionary contains pre-generated data for a single prompt.
+                The keys are:
+                - "prompt": A tensor of tokenized prompt ids.
+                - "completions": A list of tensors, each representing a tokenized completion.
+                - "rewards": A list of scalar tensors, each representing the reward for a completion.
+                - "assistant_mask": A list of tensors, each a 1D binary mask for the corresponding completion.
+        """
+        assert len(data) % (self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps) == 0, \
+            "The number of samples must be a multiple of the effective per device batch size = per_device_train_batch_size * gradient_accumulation_steps."
+        self.model.train()
+        prompts = [d["prompt"] for d in data]
+        completions = [c for d in data for c in d["completions"]]
+        rewards = [r for d in data for r in d["rewards"]]
+        assistant_masks = [m for d in data for m in d["assistant_mask"]]
+
+        num_completions_per_prompt = [len(d["completions"]) for d in data]
+        if len(set(num_completions_per_prompt)) > 1:
+            raise ValueError("All prompts must have the same number of completions.")
+        num_generations = num_completions_per_prompt[0]
+
+        batch_size = self.args.per_device_train_batch_size
+
+        with torch.no_grad():
+            # Concatenate completions and repeated prompts, pad and create masks 
+            prompt_ids = pad(prompts, padding_value=self.processing_class.pad_token_id, padding_side=self.processing_class.padding_side).to(self.accelerator.device)
+            prompt_ids = torch.repeat_interleave(prompt_ids, num_generations, dim=0).squeeze(1)
+            prompt_mask = (prompt_ids != self.processing_class.pad_token_id).long().to(self.accelerator.device)
+
+            completion_ids = pad(completions, padding_value=self.processing_class.pad_token_id, padding_side=self.processing_class.padding_side).to(self.accelerator.device).squeeze(1)
+            completion_mask = pad(assistant_masks, padding_value=0, padding_side=self.processing_class.padding_side).to(self.accelerator.device).squeeze(1)
+
+            # Calculate advantages
+            rewards_tensor = torch.stack(rewards).squeeze().to(self.accelerator.device)
+            advantages = self._calculate_advantages(rewards_tensor, num_generations)
+
+            # Prepare for loss computation
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+            logits_to_keep = completion_ids.size(1)
+
+            # get old_per_token_logps
+            old_per_token_logps = self._get_per_token_logps_and_entropies(
+                self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+            )["logps"]
+
+            # get ref_per_token_logps
+            if self.beta != 0.0:
+                if self.ref_model is not None:
+                    ref_per_token_logps = self._get_per_token_logps_and_entropies(
+                        self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+                    )["logps"]
+                else:
+                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+                        ref_per_token_logps = self._get_per_token_logps_and_entropies(
+                            self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+                        )["logps"]
+            else:
+                ref_per_token_logps = None
+
+        grad_accum_step = 0
+        losses = []
+        for i in range(0, len(prompt_ids), batch_size):
+            batch_inputs = {
+                "prompt_ids": prompt_ids[i:i+batch_size],
+                "prompt_mask": prompt_mask[i:i+batch_size],
+                "completion_ids": completion_ids[i:i+batch_size],
+                "completion_mask": completion_mask[i:i+batch_size],
+                "advantages": advantages[i:i+batch_size],
+                "old_per_token_logps": old_per_token_logps[i:i+batch_size],
+                "ref_per_token_logps": ref_per_token_logps[i:i+batch_size] if ref_per_token_logps is not None else None,
+            }
+            loss = self.compute_loss(self.model, batch_inputs)
+            self.accelerator.backward(
+                loss / self.args.gradient_accumulation_steps
+            )
+            losses.append(loss.detach())
+            grad_accum_step += 1
+            if grad_accum_step % self.args.gradient_accumulation_steps == 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                grad_accum_step = 0
+
+        mode = "train"
+        with torch.no_grad():
+            mean_grouped_rewards = rewards_tensor.view(-1, num_generations).mean(dim=1)
+            std_grouped_rewards = rewards_tensor.view(-1, num_generations).std(dim=1)
+            is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
+
+            # Log the metrics
+            self._metrics[mode]["reward"].append(self.accelerator.gather(mean_grouped_rewards).mean().item())
+            self._metrics[mode]["reward_std"].append(self.accelerator.gather(std_grouped_rewards).mean().item())
+            self._metrics[mode]["frac_reward_zero_std"].append(
+                self.accelerator.gather(is_std_zero.float()).mean().item()
+            )
+
+            if losses:
+                gathered_losses = self.accelerator.gather(torch.stack(losses))
+                mean_loss = gathered_losses.mean().item()
+                self._metrics[mode]["loss"] = [mean_loss]
+
+            # completion length metrics
+            completion_lengths = completion_mask.sum(1)
+            agg_completion_lengths = self.accelerator.gather(completion_lengths)
+            self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
+            self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
+            self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
+
+            # self.state.num_input_tokens_seen += self.accelerator.gather(attention_mask.sum()).sum().item()
+            # self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
+
+        output_metrics = {}
+        for key, value in self._metrics[mode].items():
+            output_metrics[key] = sum(value) / len(value) if value is not None and isinstance(value, list) else value
+        self._metrics[mode].clear()
+
+        return output_metrics
+
+    def _calculate_advantages(self, rewards_tensor: torch.Tensor, num_generations: int):
+        mean_grouped_rewards = rewards_tensor.view(-1, num_generations).mean(dim=1)
+        std_grouped_rewards = rewards_tensor.view(-1, num_generations).std(dim=1)
+
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
+
+        advantages = rewards_tensor - mean_grouped_rewards
+        if self.scale_rewards:
+            advantages = advantages / (std_grouped_rewards + 1e-4)
+        return advantages
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
