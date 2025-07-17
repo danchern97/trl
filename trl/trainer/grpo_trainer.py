@@ -1106,9 +1106,12 @@ class GRPOTrainer(Trainer):
                 - "rewards": A list of scalar tensors, each representing the reward for a completion.
                 - "assistant_mask": A list of tensors, each a 1D binary mask for the corresponding completion.
         """
-        assert len(data) % (self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps) == 0, \
-            "The number of samples must be a multiple of the effective per device batch size = per_device_train_batch_size * gradient_accumulation_steps."
+        assert len(data) % (self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps) == 0, (
+            "The number of samples must be a multiple of the effective per device batch size = "
+            "per_device_train_batch_size * gradient_accumulation_steps."
+        )
         self.model.train()
+
         prompts = [d["prompt"] for d in data]
         completions = [c for d in data for c in d["completions"]]
         rewards = [r for d in data for r in d["rewards"]]
@@ -1119,68 +1122,100 @@ class GRPOTrainer(Trainer):
             raise ValueError("All prompts must have the same number of completions.")
         num_generations = num_completions_per_prompt[0]
 
-        batch_size = self.args.per_device_train_batch_size
-
+        # 1. Calculate advantages for all the completions
         with torch.no_grad():
-            # Concatenate completions and repeated prompts, pad and create masks 
-            prompt_ids = pad(prompts, padding_value=self.processing_class.pad_token_id, padding_side=self.processing_class.padding_side).to(self.accelerator.device)
-            prompt_ids = torch.repeat_interleave(prompt_ids, num_generations, dim=0).squeeze(1)
-            prompt_mask = (prompt_ids != self.processing_class.pad_token_id).long().to(self.accelerator.device)
-
-            completion_ids = pad(completions, padding_value=self.processing_class.pad_token_id, padding_side=self.processing_class.padding_side).to(self.accelerator.device).squeeze(1)
-            completion_mask = pad(assistant_masks, padding_value=0, padding_side=self.processing_class.padding_side).to(self.accelerator.device).squeeze(1)
-
-            # Calculate advantages
             rewards_tensor = torch.stack(rewards).squeeze().to(self.accelerator.device)
             advantages = self._calculate_advantages(rewards_tensor, num_generations)
 
-            # Prepare for loss computation
-            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-            logits_to_keep = completion_ids.size(1)
+        # 2. Sort the samples by total length
+        repeated_prompts = [p for p in prompts for _ in range(num_generations)]
+        total_lengths = [p.size(1) + c.size(1) for p, c in zip(repeated_prompts, completions)]
+        sorted_indices = sorted(range(len(total_lengths)), key=lambda k: total_lengths[k])
 
-            # get old_per_token_logps
-            old_per_token_logps = self._get_per_token_logps_and_entropies(
-                self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
-            )["logps"]
+        # 3. Sort everything
+        sorted_indices_tensor = torch.tensor(sorted_indices, device=advantages.device)
+        sorted_prompts = [repeated_prompts[i] for i in sorted_indices]
+        sorted_completions = [completions[i] for i in sorted_indices]
+        sorted_assistant_masks = [assistant_masks[i] for i in sorted_indices]
+        sorted_advantages = advantages[sorted_indices_tensor]
 
-            # get ref_per_token_logps
-            if self.beta != 0.0:
-                if self.ref_model is not None:
-                    ref_per_token_logps = self._get_per_token_logps_and_entropies(
-                        self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
-                    )["logps"]
-                else:
-                    with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        ref_per_token_logps = self._get_per_token_logps_and_entropies(
-                            self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
-                        )["logps"]
-            else:
-                ref_per_token_logps = None
-
+        # 4. Batch everything and process
+        batch_size = self.args.per_device_train_batch_size
         grad_accum_step = 0
         losses = []
-        for i in range(0, len(prompt_ids), batch_size):
+        all_completion_masks = []
+        all_attention_masks = []
+
+        for i in range(0, len(sorted_prompts), batch_size):
+            # Slice the sorted lists to get the batch data
+            batch_prompts = sorted_prompts[i : i + batch_size]
+            batch_completions = sorted_completions[i : i + batch_size]
+            batch_assistant_masks = sorted_assistant_masks[i : i + batch_size]
+            batch_advantages = sorted_advantages[i : i + batch_size]
+
+            # Pad the batch
+            with torch.no_grad():
+                prompt_ids = pad(
+                    batch_prompts,
+                    padding_value=self.processing_class.pad_token_id,
+                    padding_side=self.processing_class.padding_side,
+                ).to(self.accelerator.device).squeeze(1)
+                prompt_mask = (prompt_ids != self.processing_class.pad_token_id).long()
+
+                completion_ids = pad(
+                    batch_completions,
+                    padding_value=self.processing_class.pad_token_id,
+                    padding_side=self.processing_class.padding_side,
+                ).to(self.accelerator.device).squeeze(1)
+                completion_mask = pad(
+                    batch_assistant_masks, padding_value=0, padding_side=self.processing_class.padding_side
+                ).to(self.accelerator.device).squeeze(1)
+                all_completion_masks.append(completion_mask)
+
+                # Prepare for loss computation
+                prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+                attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+                all_attention_masks.append(attention_mask)
+                logits_to_keep = completion_ids.size(1)
+
+                # Calculate old & ref log probs
+                old_per_token_logps = self._get_per_token_logps_and_entropies(
+                    self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size=None
+                )["logps"]
+
+                if self.beta != 0.0:
+                    if self.ref_model is not None:
+                        ref_per_token_logps = self._get_per_token_logps_and_entropies(
+                            self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size=None
+                        )["logps"]
+                    else:
+                        with self.accelerator.unwrap_model(self.model).disable_adapter():
+                            ref_per_token_logps = self._get_per_token_logps_and_entropies(
+                                self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size=None
+                            )["logps"]
+                else:
+                    ref_per_token_logps = None
+
+            # Compute loss for the batch
             batch_inputs = {
-                "prompt_ids": prompt_ids[i:i+batch_size],
-                "prompt_mask": prompt_mask[i:i+batch_size],
-                "completion_ids": completion_ids[i:i+batch_size],
-                "completion_mask": completion_mask[i:i+batch_size],
-                "advantages": advantages[i:i+batch_size],
-                "old_per_token_logps": old_per_token_logps[i:i+batch_size],
-                "ref_per_token_logps": ref_per_token_logps[i:i+batch_size] if ref_per_token_logps is not None else None,
+                "prompt_ids": prompt_ids,
+                "prompt_mask": prompt_mask,
+                "completion_ids": completion_ids,
+                "completion_mask": completion_mask,
+                "advantages": batch_advantages,
+                "old_per_token_logps": old_per_token_logps,
+                "ref_per_token_logps": ref_per_token_logps,
             }
             loss = self.compute_loss(self.model, batch_inputs)
-            self.accelerator.backward(
-                loss / self.args.gradient_accumulation_steps
-            )
+            self.accelerator.backward(loss / self.args.gradient_accumulation_steps)
             losses.append(loss.detach())
+
             grad_accum_step += 1
             if grad_accum_step % self.args.gradient_accumulation_steps == 0:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 grad_accum_step = 0
-
+        
         mode = "train"
         with torch.no_grad():
             mean_grouped_rewards = rewards_tensor.view(-1, num_generations).mean(dim=1)
@@ -1200,6 +1235,9 @@ class GRPOTrainer(Trainer):
                 self._metrics[mode]["loss"] = [mean_loss]
 
             # completion length metrics
+            completion_mask = torch.cat(all_completion_masks, dim=0)
+            attention_mask = torch.cat(all_attention_masks, dim=0)
+
             completion_lengths = completion_mask.sum(1)
             agg_completion_lengths = self.accelerator.gather(completion_lengths)
             self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
