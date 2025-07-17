@@ -1106,16 +1106,17 @@ class GRPOTrainer(Trainer):
                 - "rewards": A list of scalar tensors, each representing the reward for a completion.
                 - "assistant_mask": A list of tensors, each a 1D binary mask for the corresponding completion.
         """
-        assert len(data) % (self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps) == 0, (
-            "The number of samples must be a multiple of the effective per device batch size = "
-            "per_device_train_batch_size * gradient_accumulation_steps."
-        )
         self.model.train()
 
         prompts = [d["prompt"] for d in data]
         completions = [c for d in data for c in d["completions"]]
         rewards = [r for d in data for r in d["rewards"]]
         assistant_masks = [m for d in data for m in d["assistant_mask"]]
+
+        assert len(completions) % self.args.per_device_train_batch_size == 0, (
+            "The total number of completions must be a multiple of the effective per device batch size = "
+            f"{self.args.per_device_train_batch_size} x {self.args.gradient_accumulation_steps} = {self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps}."
+        )
 
         num_completions_per_prompt = [len(d["completions"]) for d in data]
         if len(set(num_completions_per_prompt)) > 1:
