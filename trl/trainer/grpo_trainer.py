@@ -1113,7 +1113,7 @@ class GRPOTrainer(Trainer):
         rewards = [r for d in data for r in d["rewards"]]
         assistant_masks = [m for d in data for m in d["assistant_mask"]]
 
-        assert len(completions) % self.args.per_device_train_batch_size == 0, (
+        assert len(completions) % (self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps) == 0, (
             "The total number of completions must be a multiple of the effective per device batch size = "
             f"{self.args.per_device_train_batch_size} x {self.args.gradient_accumulation_steps} = {self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps}."
         )
