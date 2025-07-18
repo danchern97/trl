@@ -1208,9 +1208,10 @@ class GRPOTrainer(Trainer):
                 "old_per_token_logps": old_per_token_logps,
                 "ref_per_token_logps": ref_per_token_logps,
             }
-            with contextlib.nullcontext() if (grad_accum_step + 1) % self.args.gradient_accumulation_steps == 0 else self.accelerator.no_sync(self.model):
-                loss = self.compute_loss(self.model, batch_inputs) / self.args.gradient_accumulation_steps
-                self.accelerator.backward(loss)
+            # TODO: as this causes deadlocks, and the gains are not that big, we disable it for now
+            # with contextlib.nullcontext() if (grad_accum_step + 1) % self.args.gradient_accumulation_steps == 0 else self.accelerator.no_sync(self.model):
+            loss = self.compute_loss(self.model, batch_inputs) / self.args.gradient_accumulation_steps
+            self.accelerator.backward(loss)
             losses.append(loss.detach())
 
             grad_accum_step += 1
