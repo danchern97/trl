@@ -16,6 +16,7 @@ import os
 import re
 import textwrap
 import warnings
+import contextlib
 from collections import defaultdict, deque
 from collections.abc import Sized
 from contextlib import nullcontext
@@ -1207,8 +1208,9 @@ class GRPOTrainer(Trainer):
                 "old_per_token_logps": old_per_token_logps,
                 "ref_per_token_logps": ref_per_token_logps,
             }
-            loss = self.compute_loss(self.model, batch_inputs)
-            self.accelerator.backward(loss / self.args.gradient_accumulation_steps)
+            with contextlib.nullcontext() if (grad_accum_step + 1) % self.args.gradient_accumulation_steps == 0 else self.accelerator.no_sync(self.model):
+                loss = self.compute_loss(self.model, batch_inputs) / self.args.gradient_accumulation_steps
+                self.accelerator.backward(loss)
             losses.append(loss.detach())
 
             grad_accum_step += 1
