@@ -1236,17 +1236,12 @@ class GRPOTrainer(Trainer):
                 self._metrics[mode]["loss"] = [mean_loss]
 
             # completion length metrics
-            completion_mask = torch.cat(all_completion_masks, dim=0)
-            attention_mask = torch.cat(all_attention_masks, dim=0)
-
-            completion_lengths = completion_mask.sum(1)
+            completion_lengths = torch.cat([completion_mask.sum(1) for completion_mask in all_completion_masks], dim=0)
             agg_completion_lengths = self.accelerator.gather(completion_lengths)
             self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
             self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
             self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
-            # self.state.num_input_tokens_seen += self.accelerator.gather(attention_mask.sum()).sum().item()
-            # self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
 
         output_metrics = {}
         for key, value in self._metrics[mode].items():
